@@ -1,3 +1,6 @@
+import enum
+import ctypes
+import functools
 import logging
 from collections import OrderedDict
 
@@ -9,9 +12,50 @@ from pydm.data_plugins.plugin import PyDMPlugin, PyDMConnection
 
 
 import pyads
+from pyads import structs, constants
 
 
 logger = logging.getLogger(__name__)
+
+
+class ADST_Type(enum.IntEnum):
+    VOID = 0
+    INT8 = 16
+    UINT8 = 17
+    INT16 = 2
+    UINT16 = 18
+    INT32 = 3
+    UINT32 = 19
+    INT64 = 20
+    UINT64 = 21
+    REAL32 = 4
+    REAL64 = 5
+    BIGTYPE = 65
+    STRING = 30
+    WSTRING = 31
+    REAL80 = 32
+    BIT = 33
+    MAXTYPES = 34
+
+
+ads_type_to_ctype = {
+    # ADST_VOID
+    ADST_Type.INT8: constants.PLCTYPE_BYTE,
+    ADST_Type.UINT8: constants.PLCTYPE_UBYTE,
+    ADST_Type.INT16: constants.PLCTYPE_INT,
+    ADST_Type.UINT16: constants.PLCTYPE_UINT,
+    ADST_Type.INT32: constants.PLCTYPE_DINT,
+    ADST_Type.UINT32: constants.PLCTYPE_UDINT,
+    ADST_Type.INT64: constants.PLCTYPE_LINT,
+    ADST_Type.UINT64: constants.PLCTYPE_ULINT,
+    ADST_Type.REAL32: constants.PLCTYPE_REAL,
+    ADST_Type.REAL64: constants.PLCTYPE_LREAL,
+    # ADST_BIGTYPE
+    ADST_Type.STRING: constants.PLCTYPE_STRING,
+    # ADST_WSTRING
+    # ADST_REAL80
+    ADST_Type.BIT: constants.PLCTYPE_BOOL,
+}
 
 
 def parse_address(addr):
@@ -54,11 +98,90 @@ def parse_address(addr):
             }
 
 
+def get_symbol_information(plc, symbol_name) -> structs.SAdsSymbolEntry:
+    return plc.read_write(
+        constants.ADSIGRP_SYM_INFOBYNAMEEX,
+        0x0,
+        structs.SAdsSymbolEntry,
+        symbol_name,
+        constants.PLCTYPE_STRING,
+    )
+
+
+def get_symbol_data_type(plc, symbol_name, *, custom_types=None):
+    info = get_symbol_information(plc, symbol_name)
+    type_name = info.type_name
+    data_type_int = info.dataType
+
+    if custom_types is None:
+        custom_types = {}
+
+    if data_type_int in custom_types:
+        data_type = custom_types[data_type_int]
+    elif type_name in custom_types:
+        # Potential feature: allow mapping of type names to structures by
+        # registering them in `custom_types`
+        data_type = custom_types[type_name]
+    elif data_type_int in ads_type_to_ctype:
+        data_type = ads_type_to_ctype[data_type_int]
+    elif type_name in ads_type_to_ctype:
+        # Potential feature: allow mapping of type names to structures by
+        # registering them in `ads_type_to_ctype`
+        data_type = ads_type_to_ctype[type_name]
+    else:
+        raise ValueError(
+            'Unsupported data type {!r} (number={} size={} comment={!r})'
+            ''.format(type_name, data_type_int,
+                      info.size, info.comment)
+        )
+
+    if data_type is constants.PLCTYPE_STRING:
+        array_length = 1
+    else:
+        # String types are handled directly by adsSyncReadReqEx2.
+        # Otherwise, if the reported size is larger than the data type
+        # size, it is an array of that type:
+        array_length = info.size // ctypes.sizeof(data_type)
+        if array_length > 1:
+            data_type = data_type * array_length
+
+    return data_type, array_length
+
+
+def enumerate_plc_symbols(plc):
+    symbol_info = plc.read(constants.ADSIGRP_SYM_UPLOADINFO, 0x0,
+                           structs.SAdsSymbolUploadInfo)
+
+    symbol_buffer = bytearray(
+        plc.read(constants.ADSIGRP_SYM_UPLOAD, 0,
+                 ctypes.c_ubyte * symbol_info.nSymSize,
+                 return_ctypes=True))
+
+    symbol_buffer = bytearray(symbol_buffer)
+
+    symbols = {}
+    while symbol_buffer:
+        if len(symbol_buffer) < ctypes.sizeof(structs.SAdsSymbolEntry):
+            symbol_buffer += (bytearray(ctypes.sizeof(structs.SAdsSymbolEntry)
+                                        - len(symbol_buffer)))
+        entry = structs.SAdsSymbolEntry.from_buffer(symbol_buffer)
+        if entry.entryLength == 0:
+            break
+
+        symbols[entry.name] = {'entry': entry,
+                               'type': entry.type_name,
+                               'comment': entry.comment}
+        symbol_buffer = symbol_buffer[entry.entryLength:]
+
+    return symbols
+
+
 class Variable:
     def __init__(self, plc, variable):
         self.plc = plc
         self.variable = variable
         self._conn = None
+        self.ads = self.plc.ads
 
     @property
     def connection(self):
@@ -69,6 +192,7 @@ class Variable:
         self._conn = conn
         self._conn.data[DataKeys.VALUE] = 3
         self._conn.send_to_channel()
+        self.data_type = get_symbol_data_type(self.ads, self.variable)
 
 
 class Plc:
@@ -79,19 +203,18 @@ class Plc:
         self.variables = {}
         self.ads = pyads.Connection(ams_id, port, ip_address=ip_address)
 
-    def __delitem__(self, variable):
+    def clear_variable(self, variable):
         _ = self.variables.pop(variable)
         if not self.variables:
             self.ads.close()
 
-    def __getitem__(self, variable):
+    def get_variable(self, variable):
         try:
             return self.variables[variable]
         except KeyError:
-            self.variables[variable] = Variable(self, variable)
             if not self.ads.is_open:
                 self.ads.open()
-
+            self.variables[variable] = Variable(self, variable)
             return self.variables[variable]
 
 
@@ -122,7 +245,7 @@ class Connection(PyDMConnection):
                                    ams_id=self.ams_id, port=self.port)
 
         self.variable_name = self.address['variable']
-        self.variable = self.conn[self.variable_name]
+        self.variable = self.conn.get_variable(self.variable_name)
         self.variable.connection = self
 
     def send_new_value(self, payload):
@@ -148,9 +271,8 @@ class Connection(PyDMConnection):
         ...
 
     def close(self):
+        self.conn.clear_variable(self.variable_name)
         super().close()
-        del self.conn[self.variable_name]
-        print('connection closed')
 
 
 class ADSPlugin(PyDMPlugin):

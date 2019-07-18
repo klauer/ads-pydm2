@@ -56,7 +56,7 @@
         <bool>true</bool>
        </property>
        <property name="channel" stdset="0">
-        <string>ads://${host}:${port}/</string>
+        <string>ads://${host}:${port}/Main.iCycle</string>
        </property>
       </widget>
      </item>
