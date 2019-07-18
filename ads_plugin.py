@@ -59,8 +59,8 @@ ads_type_to_ctype = {
 
 
 def parse_address(addr):
-    'ads://<host>[:<port>][/@reserved]/<variable>'
-    host_info, _, variable = addr.partition('/')
+    'ads://<host>[:<port>][/@reserved]/<symbol>'
+    host_info, _, symbol = addr.partition('/')
 
     if ':' in host_info:
         host, port = host_info.split(':')
@@ -81,8 +81,8 @@ def parse_address(addr):
     else:
         raise ValueError(f'Cannot parse host string: {host!r}')
 
-    if variable.startswith('@') and '/' in variable:
-        poll_info, _, variable = variable.partition('/')
+    if symbol.startswith('@') and '/' in symbol:
+        poll_info, _, symbol = symbol.partition('/')
         reserved = poll_info.lstrip('@')
     else:
         # for future usage
@@ -93,7 +93,7 @@ def parse_address(addr):
             'ams_id': ams_id,
             'port': int(port),
             'reserved': float(reserved),
-            'variable': variable,
+            'symbol': symbol,
             'use_notify': True,
             }
 
@@ -176,23 +176,22 @@ def enumerate_plc_symbols(plc):
     return symbols
 
 
-class Variable:
-    def __init__(self, plc, variable):
+class Symbol:
+    def __init__(self, plc, symbol):
         self.plc = plc
-        self.variable = variable
-        self._conn = None
+        self.symbol = symbol
+        self.connection = None
         self.ads = self.plc.ads
+        self.data_type = None
+        self.array_size = None
 
-    @property
-    def connection(self):
-        return self._conn
-
-    @connection.setter
-    def connection(self, conn):
+    def set_connection(self, conn):
         self._conn = conn
+        self.data_type, self.array_size = get_symbol_data_type(
+            self.ads, self.symbol)
+
         self._conn.data[DataKeys.VALUE] = 3
         self._conn.send_to_channel()
-        self.data_type = get_symbol_data_type(self.ads, self.variable)
 
 
 class Plc:
@@ -200,22 +199,22 @@ class Plc:
         self.ip_address = ip_address
         self.ams_id = ams_id
         self.port = port
-        self.variables = {}
+        self.symbols = {}
         self.ads = pyads.Connection(ams_id, port, ip_address=ip_address)
 
-    def clear_variable(self, variable):
-        _ = self.variables.pop(variable)
-        if not self.variables:
+    def clear_symbol(self, symbol):
+        _ = self.symbols.pop(symbol)
+        if not self.symbols:
             self.ads.close()
 
-    def get_variable(self, variable):
+    def get_symbol(self, symbol_name):
         try:
-            return self.variables[variable]
+            return self.symbols[symbol_name]
         except KeyError:
             if not self.ads.is_open:
                 self.ads.open()
-            self.variables[variable] = Variable(self, variable)
-            return self.variables[variable]
+            self.symbols[symbol_name] = Symbol(self, symbol_name)
+            return self.symbols[symbol_name]
 
 
 _PLCS = {}
@@ -244,9 +243,9 @@ class Connection(PyDMConnection):
         self.conn = get_connection(ip_address=self.ip_address,
                                    ams_id=self.ams_id, port=self.port)
 
-        self.variable_name = self.address['variable']
-        self.variable = self.conn.get_variable(self.variable_name)
-        self.variable.connection = self
+        self.symbol_name = self.address['symbol']
+        self.symbol = self.conn.get_symbol(self.symbol_name)
+        self.symbol.set_connection(self)
 
     def send_new_value(self, payload):
         # if isinstance(payload, Disconnected):
@@ -271,7 +270,7 @@ class Connection(PyDMConnection):
         ...
 
     def close(self):
-        self.conn.clear_variable(self.variable_name)
+        self.conn.clear_symbol(self.symbol_name)
         super().close()
 
 
