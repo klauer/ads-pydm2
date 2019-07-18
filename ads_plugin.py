@@ -1,15 +1,12 @@
 import ctypes
 import enum
-import functools
 import logging
 import queue
 import struct
 import threading
 import time
 
-from collections import OrderedDict
-
-from qtpy.QtCore import Slot
+from qtpy import QtCore
 
 from pydm.utilities.channel import parse_channel_config
 from pydm.data_store import DataKeys
@@ -271,6 +268,7 @@ class Symbol:
     def set_connection(self, conn):
         def init():
             if self.poll_rate is None:
+                self._update_data_type()
                 attr = pyads.NotificationAttrib(ctypes.sizeof(self.data_type))
                 self.notification_handle = self.ads.add_device_notification(
                     self.symbol, attr, self._notification_update)
@@ -393,7 +391,7 @@ class Connection(PyDMConnection):
         self.data.update(payload)
         self.send_to_channel()
 
-    @Slot(dict)
+    @QtCore.Slot(dict)
     def receive_from_channel(self, payload):
         value = payload[DataKeys.VALUE]
         self.symbol.write(value)
