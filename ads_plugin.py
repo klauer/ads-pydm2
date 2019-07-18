@@ -240,7 +240,9 @@ class Symbol:
 
     def send_to_channel(self, timestamp, value):
         self.data.update(**{
+            DataKeys.CONNECTION: True,
             DataKeys.VALUE: value,
+            DataKeys.WRITE_ACCESS: True,
             # DataKeys.TIMESTAMP: time.time(),
         })
         self.conn.send_new_value(self.data)
@@ -248,7 +250,17 @@ class Symbol:
     def _update_data_type(self):
         self.data_type, self.array_size = get_symbol_data_type(
             self.ads, self.symbol)
-        self.data[DataKeys.CONNECTION] = True
+
+    def write(self, value):
+        try:
+            if self.data_type not in (constants.PLCTYPE_REAL,
+                                      constants.PLCTYPE_LREAL):
+                # TODO ... int types
+                value = int(value)
+            self.ads.write_by_name(self.symbol, value=value,
+                                   plc_datatype=self.data_type)
+        except Exception:
+            logger.exception('Failed to write %s to %s', self.symbol, value)
 
     def poll(self):
         if self.data_type is None:
@@ -304,7 +316,8 @@ class Plc:
         while self.running:
             info = self.poll_threads[rate]
             t0 = time.time()
-            for func, args, kwargs in list(info['calls']):
+            for item in list(info['calls']):
+                func, args, kwargs = item
                 try:
                     func(*args, **kwargs)
                 except Exception:
@@ -314,7 +327,7 @@ class Plc:
                         self.ip_address, self.ams_id, self.port,
                         rate, func.__name__, args, kwargs
                     )
-                    info['calls'].remove(func)
+                    info['calls'].remove(item)
             elapsed = time.time() - t0
             time.sleep(max((0, rate - elapsed)))
 
@@ -382,7 +395,8 @@ class Connection(PyDMConnection):
 
     @Slot(dict)
     def receive_from_channel(self, payload):
-        ...
+        value = payload[DataKeys.VALUE]
+        self.symbol.write(value)
 
     def close(self):
         print('connection closed', self.symbol_name)
