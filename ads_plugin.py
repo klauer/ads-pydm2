@@ -1,7 +1,12 @@
-import enum
 import ctypes
+import enum
 import functools
 import logging
+import queue
+import struct
+import threading
+import time
+
 from collections import OrderedDict
 
 from qtpy.QtCore import Slot
@@ -59,7 +64,7 @@ ads_type_to_ctype = {
 
 
 def parse_address(addr):
-    'ads://<host>[:<port>][/@reserved]/<symbol>'
+    'ads://<host>[:<port>][/@poll_rate]/<symbol>'
     host_info, _, symbol = addr.partition('/')
 
     if ':' in host_info:
@@ -83,16 +88,15 @@ def parse_address(addr):
 
     if symbol.startswith('@') and '/' in symbol:
         poll_info, _, symbol = symbol.partition('/')
-        reserved = poll_info.lstrip('@')
+        poll_rate = poll_info.lstrip('@')
     else:
-        # for future usage
-        reserved = 0.5
+        poll_rate = None
 
     return {'ip_address': ip_address,
             'host': host,
             'ams_id': ams_id,
             'port': int(port),
-            'reserved': float(reserved),
+            'poll_rate': float(poll_rate) if poll_rate is not None else None,
             'symbol': symbol,
             'use_notify': True,
             }
@@ -106,6 +110,47 @@ def get_symbol_information(plc, symbol_name) -> structs.SAdsSymbolEntry:
         symbol_name,
         constants.PLCTYPE_STRING,
     )
+
+
+def unpack_notification(notification, plc_datatype):
+    contents = notification.contents
+    data_size = contents.cbSampleSize
+    # Get dynamically sized data array
+    data = (ctypes.c_ubyte * data_size).from_address(
+        ctypes.addressof(contents) +
+        structs.SAdsNotificationHeader.data.offset)
+
+    datatype_map = {
+        constants.PLCTYPE_BOOL: "<?",
+        constants.PLCTYPE_BYTE: "<c",
+        constants.PLCTYPE_DINT: "<i",
+        constants.PLCTYPE_DWORD: "<I",
+        constants.PLCTYPE_INT: "<h",
+        constants.PLCTYPE_LREAL: "<d",
+        constants.PLCTYPE_REAL: "<f",
+        constants.PLCTYPE_SINT: "<b",
+        constants.PLCTYPE_UDINT: "<L",
+        constants.PLCTYPE_UINT: "<H",
+        constants.PLCTYPE_USINT: "<B",
+        constants.PLCTYPE_WORD: "<H",
+    }
+
+    if plc_datatype == constants.PLCTYPE_STRING:
+        # read only until null-termination character
+        value = bytearray(data).split(b"\0", 1)[0].decode("utf-8")
+
+    elif issubclass(plc_datatype, ctypes.Structure):
+        value = plc_datatype()
+        fit_size = min(data_size, ctypes.sizeof(value))
+        ctypes.memmove(ctypes.addressof(value), ctypes.addressof(data),
+                       fit_size)
+    elif plc_datatype not in datatype_map:
+        value = bytearray(data)
+    else:
+        value, = struct.unpack(datatype_map[plc_datatype], bytearray(data))
+
+    timestamp = pyads.filetimes.filetime_to_dt(contents.nTimeStamp)
+    return timestamp, value
 
 
 def get_symbol_data_type(plc, symbol_name, *, custom_types=None):
@@ -177,44 +222,127 @@ def enumerate_plc_symbols(plc):
 
 
 class Symbol:
-    def __init__(self, plc, symbol):
+    def __init__(self, plc, symbol, poll_rate):
         self.plc = plc
         self.symbol = symbol
         self.connection = None
         self.ads = self.plc.ads
         self.data_type = None
         self.array_size = None
+        self.conn = None
+        self.notification_handle = None
+        self.poll_rate = poll_rate
+        self.data = {DataKeys.CONNECTION: False}
 
-    def set_connection(self, conn):
-        self._conn = conn
+    def _notification_update(self, notification, name):
+        timestamp, value = unpack_notification(notification, self.data_type)
+        self.send_to_channel(timestamp, value)
+
+    def send_to_channel(self, timestamp, value):
+        self.data.update(**{
+            DataKeys.VALUE: value,
+            # DataKeys.TIMESTAMP: time.time(),
+        })
+        self.conn.send_new_value(self.data)
+
+    def _update_data_type(self):
         self.data_type, self.array_size = get_symbol_data_type(
             self.ads, self.symbol)
+        self.data[DataKeys.CONNECTION] = True
 
-        self._conn.data[DataKeys.VALUE] = 3
-        self._conn.send_to_channel()
+    def poll(self):
+        if self.data_type is None:
+            self._update_data_type()
+        value = self.ads.read_by_name(self.symbol, plc_datatype=self.data_type)
+        self.send_to_channel(time.time(), value)
+
+    def set_connection(self, conn):
+        def init():
+            if self.poll_rate is None:
+                attr = pyads.NotificationAttrib(ctypes.sizeof(self.data_type))
+                self.notification_handle = self.ads.add_device_notification(
+                    self.symbol, attr, self._notification_update)
+            else:
+                self.poll()
+
+        self.conn = conn
+        self.plc.add_to_queue(init)
+        if self.poll_rate is not None:
+            self.plc.add_to_poll_thread(self.poll_rate, self.poll)
 
 
 class Plc:
     def __init__(self, ip_address, ams_id, port):
+        self.running = True
         self.ip_address = ip_address
         self.ams_id = ams_id
         self.port = port
         self.symbols = {}
         self.ads = pyads.Connection(ams_id, port, ip_address=ip_address)
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._thread, daemon=True)
+        self.thread.start()
+        self.poll_threads = {}
+
+    def add_to_poll_thread(self, rate, func, *args, **kwargs):
+        if rate not in self.poll_threads:
+            thread = threading.Thread(target=self._poll_thread, args=(rate, ),
+                                      daemon=True)
+            self.poll_threads[rate] = dict(thread=thread, calls=[])
+            thread.start()
+
+        self.poll_threads[rate]['calls'].append((func, args, kwargs))
+
+    def stop(self):
+        self.running = False
+        self.add_to_queue(lambda: None)
+
+    def add_to_queue(self, func, *args, **kwargs):
+        self.queue.put((func, args, kwargs))
+
+    def _poll_thread(self, rate):
+        while self.running:
+            info = self.poll_threads[rate]
+            t0 = time.time()
+            for func, args, kwargs in list(info['calls']):
+                try:
+                    func(*args, **kwargs)
+                except Exception:
+                    logger.exception(
+                        'Poll thread %s:%s:%d @ %.3f sec failure: '
+                        '%s(*%r, **%r)',
+                        self.ip_address, self.ams_id, self.port,
+                        rate, func.__name__, args, kwargs
+                    )
+                    info['calls'].remove(func)
+            elapsed = time.time() - t0
+            time.sleep(max((0, rate - elapsed)))
+
+    def _thread(self):
+        while self.running:
+            func, args, kwargs = self.queue.get()
+            try:
+                func(*args, **kwargs)
+            except Exception:
+                logger.exception('PLC thread %s:%s:%d failure: %s(*%r, **%r)',
+                                 self.ip_address, self.ams_id, self.port,
+                                 func.__name__, args, kwargs)
+        self.ads.close()
 
     def clear_symbol(self, symbol):
         _ = self.symbols.pop(symbol)
         if not self.symbols:
             self.ads.close()
 
-    def get_symbol(self, symbol_name):
+    def get_symbol(self, symbol_name, poll_rate):
+        key = (symbol_name, poll_rate)
         try:
-            return self.symbols[symbol_name]
+            return self.symbols[key]
         except KeyError:
             if not self.ads.is_open:
                 self.ads.open()
-            self.symbols[symbol_name] = Symbol(self, symbol_name)
-            return self.symbols[symbol_name]
+            self.symbols[key] = Symbol(self, symbol_name, poll_rate)
+            return self.symbols[key]
 
 
 _PLCS = {}
@@ -240,37 +368,25 @@ class Connection(PyDMConnection):
         self.ip_address = self.address['ip_address']
         self.ams_id = self.address['ams_id']
         self.port = self.address['port']
-        self.conn = get_connection(ip_address=self.ip_address,
-                                   ams_id=self.ams_id, port=self.port)
+        self.poll_rate = self.address['poll_rate']
+        self.plc = get_connection(ip_address=self.ip_address,
+                                  ams_id=self.ams_id, port=self.port)
 
         self.symbol_name = self.address['symbol']
-        self.symbol = self.conn.get_symbol(self.symbol_name)
+        self.symbol = self.plc.get_symbol(self.symbol_name, self.poll_rate)
         self.symbol.set_connection(self)
 
     def send_new_value(self, payload):
-        # if isinstance(payload, Disconnected):
-        #     self.data = {'CONNECTION': False}
-        # else:
-        #     self.data = payload.todict(None, OrderedDict)
-        #     if self.nt_id != payload.getID():
-        #         self.nt_id = payload.getID()
-        #         intro_keys = nt_introspection.get(self.nt_id, None)
-        #         if intro_keys is not None:
-        #             self.introspection = DataKeys.generate_introspection_for(
-        #                 **intro_keys
-        #             )
-        #     pre_process(self.data, payload.getID())
-        #     self.data['CONNECTION'] = True
-        #     self.data['WRITE_ACCESS'] = True
-        # self.send_to_channel()
-        ...
+        self.data.update(payload)
+        self.send_to_channel()
 
     @Slot(dict)
     def receive_from_channel(self, payload):
         ...
 
     def close(self):
-        self.conn.clear_symbol(self.symbol_name)
+        print('connection closed', self.symbol_name)
+        self.plc.clear_symbol(self.symbol_name)
         super().close()
 
 
