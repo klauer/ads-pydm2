@@ -103,4 +103,13 @@ class AdsSignal(Signal):
             self._symbol.stop()
 
     def destroy(self):
+        if self._symbol is None:
+            return
+
+        try:
+            self._symbol.callbacks.remove(self._value_changed)
+        except ValueError:
+            ...
         self._symbol.stop()
+        self._symbol = None
+        return super().destroy()
