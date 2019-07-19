@@ -174,36 +174,36 @@ def enumerate_plc_symbols(plc):
 
 class Symbol:
     def __init__(self, plc, symbol, poll_rate):
+        self._subscribed = False
         self.plc = plc
         self.symbol = symbol
         self.connection = None
         self.ads = self.plc.ads
         self.data_type = None
         self.array_size = None
-        self.conn = None
         self.notification_handle = None
         self.poll_rate = poll_rate
-        self.data = {'CONNECTION': False}
+
+    def value_updated(self, timestamp, value):
+        'Value update hook for subclasses'
 
     def _notification_update(self, notification, name):
         timestamp, value = unpack_notification(notification, self.data_type)
-        self.send_to_channel(timestamp, value)
-
-    def send_to_channel(self, timestamp, value):
-        self.data.update(**{
-            'CONNECTION': True,
-            'VALUE': value,
-            'WRITE_ACCESS': True,
-            # 'TIMESTAMP': time.time(),
-        })
-        self.conn.send_new_value(self.data)
+        self.value_updated(timestamp, value)
 
     def _update_data_type(self):
         self.data_type, self.array_size = get_symbol_data_type(
             self.ads, self.symbol)
 
+    def read(self):
+        if self.data_type is None:
+            self._update_data_type()
+        return self.ads.read_by_name(self.symbol, plc_datatype=self.data_type)
+
     def write(self, value):
         try:
+            if self.data_type is None:
+                self._update_data_type()
             if self.data_type not in (constants.PLCTYPE_REAL,
                                       constants.PLCTYPE_LREAL):
                 # TODO ... int types
@@ -213,13 +213,18 @@ class Symbol:
         except Exception:
             logger.exception('Failed to write %s to %s', self.symbol, value)
 
-    def poll(self):
+    def _poll(self):
         if self.data_type is None:
             self._update_data_type()
         value = self.ads.read_by_name(self.symbol, plc_datatype=self.data_type)
-        self.send_to_channel(time.time(), value)
+        self.value_updated(time.time(), value)
 
-    def set_connection(self, conn):
+    def start(self):
+        if self._subscribed:
+            return
+
+        self._subscribed = True
+
         def init():
             if self.poll_rate is None:
                 self._update_data_type()
@@ -227,12 +232,23 @@ class Symbol:
                 self.notification_handle = self.ads.add_device_notification(
                     self.symbol, attr, self._notification_update)
             else:
-                self.poll()
+                self._poll()
 
-        self.conn = conn
         self.plc.add_to_queue(init)
         if self.poll_rate is not None:
-            self.plc.add_to_poll_thread(self.poll_rate, self.poll)
+            self.plc.add_to_poll_thread(self.poll_rate, self._poll)
+
+    def stop(self):
+        if not self._subscribed:
+            return
+
+        self.plc.stop_polling(self.poll_rate, self._poll)
+        handle = self.notification_handle
+        if self.poll_rate is None and handle is not None:
+            self.notification_handle = None
+            self.ads.del_device_notification(*handle)
+
+        self._subscribed = False
 
 
 class Plc:
@@ -247,6 +263,13 @@ class Plc:
         self.thread = threading.Thread(target=self._thread, daemon=True)
         self.thread.start()
         self.poll_threads = {}
+
+    def stop_polling(self, rate, func, *args, **kwargs):
+        if rate not in self.poll_threads:
+            return
+
+        # TODO cid
+        self.poll_threads[rate]['calls'].remove((func, args, kwargs))
 
     def add_to_poll_thread(self, rate, func, *args, **kwargs):
         if rate not in self.poll_threads:
@@ -299,14 +322,14 @@ class Plc:
         if not self.symbols:
             self.ads.close()
 
-    def get_symbol(self, symbol_name, poll_rate):
-        key = (symbol_name, poll_rate)
+    def get_symbol(self, symbol_name, poll_rate, *, cls=Symbol):
+        key = (symbol_name, poll_rate, cls)
         try:
             return self.symbols[key]
         except KeyError:
             if not self.ads.is_open:
                 self.ads.open()
-            self.symbols[key] = Symbol(self, symbol_name, poll_rate)
+            self.symbols[key] = cls(self, symbol_name, poll_rate)
             return self.symbols[key]
 
 
