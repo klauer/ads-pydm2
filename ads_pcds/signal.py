@@ -74,25 +74,29 @@ class AdsSignal(Signal):
         'Read the Symbol value over ADS'
         value = self._symbol.read()
         super().put(value=value, timestamp=time.time(), force=True)
+        if not self._subscribed:
+            self._run_metadata_callbacks()
         return value
 
     def put(self, value):
         'Write to the Symbol over ADS'
-        value = self._symbol.write(value)
+        self._symbol.write(value)
         super().put(value=value, timestamp=time.time(), force=True)
 
     def _value_changed(self, timestamp, value):
         'ADS callback indicating that the value has changed'
         # super().put updates value+metadata and runs SUB_VALUE
         super().put(value=value, timestamp=timestamp, force=True)
+        self._run_metadata_callbacks()
 
     def subscribe(self, callback, event_type=None, run=True):
         if event_type is None:
             event_type = self._default_sub
 
-        if self._value_changed not in self._symbol.callbacks:
+        if not self._subscribed and event_type in {'value', 'meta'}:
             self._symbol.callbacks.append(self._value_changed)
             self._symbol.start()
+            self._subscribed = True
 
         return super().subscribe(callback, event_type=event_type, run=run)
 
