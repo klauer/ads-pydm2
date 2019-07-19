@@ -148,6 +148,9 @@ def enumerate_plc_symbols(plc):
     symbol_info = plc.read(constants.ADSIGRP_SYM_UPLOADINFO, 0x0,
                            structs.SAdsSymbolUploadInfo)
 
+    if symbol_info is None:
+        raise RuntimeError('PLC connection not open')
+
     symbol_buffer = bytearray(
         plc.read(constants.ADSIGRP_SYM_UPLOAD, 0,
                  ctypes.c_ubyte * symbol_info.nSymSize,
