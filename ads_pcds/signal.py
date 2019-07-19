@@ -100,11 +100,19 @@ class AdsSignal(Signal):
 
         return super().subscribe(callback, event_type=event_type, run=run)
 
+    def _stop_subscription(self):
+        self._symbol.callbacks.remove(self._value_changed)
+        self._symbol.stop()
+        self._subscribed = False
+
+    def unsubscribe_all(self):
+        super().unsubscribe_all()
+        self._stop_subscription()
+
     def unsubscribe(self, cid):
         super().unsubscribe(cid)
         if not any(cb for cb in self._callbacks.values()):
-            self._symbol.callbacks.remove(self._value_changed)
-            self._symbol.stop()
+            self._stop_subscription()
 
     def destroy(self):
         if self._symbol is None:
