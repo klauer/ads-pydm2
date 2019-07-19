@@ -1,5 +1,12 @@
-def parse_address(addr):
-    'ads://<host>[:<port>][/@poll_rate]/<symbol>'
+def parse_address(addr, *, allow_macros=False):
+    '''
+    ads://<host>[:<port>][/@poll_rate]/<symbol>
+
+    host can be:
+        ip_address
+        ams_id
+        ams_id@ip_address
+    '''
     if addr.startswith('ads:'):
         addr = addr[4:].lstrip('/')
 
@@ -21,6 +28,9 @@ def parse_address(addr):
             raise ValueError('Cannot assume IP address without an AMS ID '
                              'that ends with .1.1')
         ip_address = ams_id[:-4]
+    elif '${' in host and allow_macros:
+        ip_address = host
+        ams_id = ''
     else:
         raise ValueError(f'Cannot parse host string: {host!r}')
 
@@ -30,11 +40,26 @@ def parse_address(addr):
     else:
         poll_rate = None
 
+    try:
+        port = int(port)
+    except ValueError:
+        if not (allow_macros and '${' in port):
+            raise
+
+    try:
+        if poll_rate is None or poll_rate == '':
+            poll_rate = None
+        else:
+            poll_rate = float(poll_rate)
+    except ValueError:
+        if not (allow_macros and '${' in poll_rate):
+            raise
+
     return {'ip_address': ip_address,
             'host': host,
             'ams_id': ams_id,
-            'port': int(port),
-            'poll_rate': float(poll_rate) if poll_rate is not None else None,
+            'port': port,
+            'poll_rate': poll_rate,
             'symbol': symbol,
             }
 
@@ -44,8 +69,12 @@ def make_address(ip_address, ams_id, port, symbol, *, poll_rate=None):
 
     if ip_address and (ip_address + '.1.1' == ams_id):
         host = ip_address
-    else:
+    elif ip_address and ams_id:
         host = f'{ams_id}@{ip_address}'
+    elif ip_address:
+        host = ip_address
+    elif ams_id:
+        host = ams_id
 
-    port_info = f'@{port}' if port != 851 else ''
+    port_info = f':{port}' if port not in ('851', 851, None) else ''
     return f'ads://{host}{port_info}{poll_info}/{symbol}'
